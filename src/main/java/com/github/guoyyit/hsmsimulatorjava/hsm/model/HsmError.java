@@ -1,0 +1,31 @@
+package com.github.guoyyit.hsmsimulatorjava.hsm.model;
+
+/**
+ * Distinguishable failure reasons returned by the HSM service.
+ */
+public enum HsmError {
+    TOKEN_NOT_INITIALIZED,
+    TOKEN_ALREADY_INITIALIZED,
+    TOKEN_LOCKED,
+    SESSION_HANDLE_INVALID,
+    SESSION_CLOSED,
+    ALREADY_LOGGED_IN,
+    NOT_LOGGED_IN,
+    LOGIN_REQUIRED,
+    ROLE_REQUIRED,
+    PIN_INCORRECT,
+    PIN_LOCKED,
+    KEY_NOT_FOUND,
+    KEY_DESTROYED,
+    KEY_SENSITIVE,
+    KEY_USAGE_VIOLATION,
+    KEY_NOT_EXTRACTABLE,
+    INVALID_KEY_TYPE,
+    INVALID_ARGUMENT,
+    SIGNATURE_INVALID,
+    DECRYPT_FAILED,
+    WRAPPING_FAILED,
+    UNWRAPPING_FAILED,
+    PERSISTENCE_FAILED,
+    INTERNAL_ERROR
+}
