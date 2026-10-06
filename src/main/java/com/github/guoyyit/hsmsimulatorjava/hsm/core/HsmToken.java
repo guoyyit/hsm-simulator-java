@@ -38,6 +38,14 @@ public class HsmToken {
 
     static final int DEFAULT_MAX_PIN_ATTEMPTS = 3;
 
+    /**
+     * AAD for user-data AES-GCM. It must not depend on the key id: an
+     * unwrapped copy carries the same material under a new id and has to
+     * interoperate with the source key in both directions.
+     */
+    private static final byte[] DATA_AAD =
+            "hsm-data-protection-v1".getBytes(StandardCharsets.UTF_8);
+
     private final CryptoEngine crypto = new CryptoEngine();
     private final SessionManager sessions = new SessionManager();
     private final Object lock = new Object();
@@ -134,8 +142,16 @@ public class HsmToken {
         sessions.close(handle);
     }
 
+    /**
+     * Drops every open session in one serialized step. Only in-memory session
+     * state is affected: the lock flag, PIN counters and key objects are
+     * untouched, and new sessions can be opened and logged in immediately
+     * afterwards. Closing a single session never interferes with this.
+     */
     public void closeAllSessions() {
-        sessions.closeAll();
+        synchronized (lock) {
+            sessions.closeAll();
+        }
     }
 
     public void login(long sessionHandle, UserType userType, String pin) {
@@ -169,6 +185,17 @@ public class HsmToken {
 
     public String generateKey(long sessionHandle, KeyType keyType, int bits,
                               String label, Set<KeyUsage> usages) {
+        return generateKey(sessionHandle, keyType, bits, label, usages, null);
+    }
+
+    /**
+     * Generates a key. {@code extractable} decides whether the key may be
+     * exported via wrapping; when {@code null} the existing default
+     * (non-extractable) applies. The attribute is persisted with the token
+     * state and reported by {@link #getKeyInfo}.
+     */
+    public String generateKey(long sessionHandle, KeyType keyType, int bits,
+                              String label, Set<KeyUsage> usages, Boolean extractable) {
         if (keyType == null) {
             throw new HsmException(HsmError.INVALID_ARGUMENT, "keyType required");
         }
@@ -197,7 +224,7 @@ public class HsmToken {
                 keyBits = rsaBits;
             }
             StoredKey key = new StoredKey(id, safeLabel(label), keyType, keyBits,
-                    normalizedUsages, true, false, System.currentTimeMillis(),
+                    normalizedUsages, true, resolveExtractable(extractable), System.currentTimeMillis(),
                     protectedMaterial, publicMaterial);
             snapshot.getKeys().put(id, key);
             persist(snapshot);
@@ -207,6 +234,17 @@ public class HsmToken {
 
     public String importKey(long sessionHandle, KeyType keyType, String label, Set<KeyUsage> usages,
                             boolean sensitive, byte[] rawOrPrivate, byte[] publicPart) {
+        return importKey(sessionHandle, keyType, label, usages, sensitive, rawOrPrivate, publicPart, null);
+    }
+
+    /**
+     * Imports a key. {@code extractable} decides whether the key may be
+     * exported via wrapping; when {@code null} the existing default
+     * (non-extractable) applies.
+     */
+    public String importKey(long sessionHandle, KeyType keyType, String label, Set<KeyUsage> usages,
+                            boolean sensitive, byte[] rawOrPrivate, byte[] publicPart,
+                            Boolean extractable) {
         if (keyType == null || rawOrPrivate == null || rawOrPrivate.length == 0) {
             throw new HsmException(HsmError.INVALID_ARGUMENT, "keyType and material required");
         }
@@ -230,7 +268,7 @@ public class HsmToken {
                 keyBits = rsaKeyBits(rawOrPrivate);
             }
             StoredKey key = new StoredKey(id, safeLabel(label), keyType, keyBits,
-                    normalizedUsages, sensitive, false, System.currentTimeMillis(),
+                    normalizedUsages, sensitive, resolveExtractable(extractable), System.currentTimeMillis(),
                     protect(id, rawOrPrivate), publicMaterial);
             snapshot.getKeys().put(id, key);
             persist(snapshot);
@@ -299,7 +337,7 @@ public class HsmToken {
             requireOperableSession(sessionHandle);
             StoredKey key = requireUsableKey(keyId, KeyUsage.ENCRYPT);
             if (key.getKeyType() == KeyType.AES) {
-                return crypto.aesGcmEncryptWithIv(unprotect(key), data, aadFor(key));
+                return crypto.aesGcmEncryptWithIv(unprotect(key), data, DATA_AAD);
             }
             return crypto.rsaEncrypt(key.getPublicMaterial(), data);
         }
@@ -311,7 +349,7 @@ public class HsmToken {
             requireOperableSession(sessionHandle);
             StoredKey key = requireUsableKey(keyId, KeyUsage.DECRYPT);
             byte[] plaintext = key.getKeyType() == KeyType.AES
-                    ? crypto.aesGcmDecryptWithIv(unprotect(key), ciphertext, aadFor(key))
+                    ? crypto.aesGcmDecryptWithIv(unprotect(key), ciphertext, DATA_AAD)
                     : crypto.rsaDecrypt(unprotect(key), ciphertext);
             if (plaintext == null) {
                 throw new HsmException(HsmError.DECRYPT_FAILED);
@@ -332,9 +370,12 @@ public class HsmToken {
 
     /**
      * Exports a key only as protected ciphertext under an AES wrapping key
-     * that permits WRAP. Key type, size and allowed usages are bound to the
-     * envelope as AES-GCM AAD, so they cannot be altered in transit and are
-     * preserved exactly on unwrap.
+     * that permits WRAP. Key type, size, allowed usages, sensitivity and
+     * extractability are bound to the envelope as AES-GCM AAD, so they cannot
+     * be altered in transit and are preserved exactly on unwrap. A target
+     * marked non-extractable is rejected with
+     * {@link HsmError#KEY_NOT_EXTRACTABLE}, distinct from usage, not-found
+     * and destroyed failures.
      */
     public byte[] wrapKey(long sessionHandle, String wrappingKeyId, String targetKeyId) {
         synchronized (lock) {
@@ -343,6 +384,10 @@ public class HsmToken {
             StoredKey target = requireUsableKey(targetKeyId, null);
             if (wrappingKey.getKeyType() != KeyType.AES) {
                 throw new HsmException(HsmError.INVALID_KEY_TYPE, "wrapping key must be AES");
+            }
+            if (!target.isExtractable()) {
+                throw new HsmException(HsmError.KEY_NOT_EXTRACTABLE,
+                        "key " + targetKeyId + " is not extractable");
             }
             byte[] headerBytes = buildEnvelopeHeader(target);
             byte[] wrappedMaterial;
@@ -404,11 +449,14 @@ public class HsmToken {
                             "unwrap template differs from wrapped key usages");
                 }
                 boolean sensitive = Boolean.TRUE.equals(header.get("sensitive"));
+                // Envelopes written before extractability was tracked lack the
+                // field; those copies stay non-extractable as before.
+                boolean extractable = Boolean.TRUE.equals(header.get("extractable"));
                 byte[] publicMaterial = header.get("public") == null ? null
                         : Base64.getDecoder().decode((String) header.get("public"));
                 String id = newKeyId();
                 StoredKey key = new StoredKey(id, safeLabel(label), keyType, keyBits,
-                        EnumSet.copyOf(embeddedUsages), sensitive, false, System.currentTimeMillis(),
+                        EnumSet.copyOf(embeddedUsages), sensitive, extractable, System.currentTimeMillis(),
                         protect(id, rawKey), publicMaterial);
                 snapshot.getKeys().put(id, key);
                 persist(snapshot);
@@ -480,8 +528,11 @@ public class HsmToken {
     }
 
     /**
-     * Operations on stored objects require an unlocked token and a logged-in
-     * session. Role-specific checks are layered on top where needed.
+     * Key-object management and cryptographic operations require an unlocked
+     * token and a session logged in as the ordinary user. SO sessions are
+     * rejected with {@link HsmError#ROLE_REQUIRED}, a reason distinct from
+     * {@link HsmError#NOT_LOGGED_IN}, {@link HsmError#SESSION_HANDLE_INVALID}
+     * and {@link HsmError#TOKEN_LOCKED}.
      */
     private Session requireOperableSession(long handle) {
         requireInitialized();
@@ -492,6 +543,7 @@ public class HsmToken {
         if (!session.isLoggedIn()) {
             throw new HsmException(HsmError.NOT_LOGGED_IN);
         }
+        session.requireRole(UserType.USER);
         return session;
     }
 
@@ -500,6 +552,14 @@ public class HsmToken {
             throw new HsmException(HsmError.INVALID_ARGUMENT, "at least one usage required");
         }
         return EnumSet.copyOf(usages);
+    }
+
+    /**
+     * Keys are non-extractable unless the caller explicitly opts in to
+     * wrapping export; this matches the default stored by earlier versions.
+     */
+    private boolean resolveExtractable(Boolean extractable) {
+        return extractable != null && extractable;
     }
 
     private String safeLabel(String label) {
@@ -534,10 +594,6 @@ public class HsmToken {
         if (data == null || data.length == 0) {
             throw new HsmException(HsmError.INVALID_ARGUMENT, "data required");
         }
-    }
-
-    private byte[] aadFor(StoredKey key) {
-        return ("hsm-key:" + key.getId()).getBytes(StandardCharsets.UTF_8);
     }
 
     private byte[] protect(String keyId, byte[] raw) {
@@ -606,6 +662,7 @@ public class HsmToken {
         header.put("keyBits", target.getKeyBits());
         header.put("usages", target.getUsages().stream().map(Enum::name).sorted().toList());
         header.put("sensitive", target.isSensitive());
+        header.put("extractable", target.isExtractable());
         header.put("public", target.getPublicMaterial() == null ? null
                 : Base64.getEncoder().encodeToString(target.getPublicMaterial()));
         return writeJson(header);

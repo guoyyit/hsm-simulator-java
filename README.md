@@ -27,21 +27,56 @@ mvn test                     # 全部自动化测试
 - 类型为 `AES`（128/192/256）与 `RSA`（≥2048）。
 - 属性包含 `id`、`label`、`keyType`、`keyBits`、`usages`、`sensitive`、`extractable`、`destroyed`。
 - 允许用途 `KeyUsage`：`SIGN`、`VERIFY`、`ENCRYPT`、`DECRYPT`、`WRAP`、`UNWRAP`。
-- 敏感/私钥材料在快照中以主密钥 AES-GCM 加密保存且 `extractable=false`，服务不提供任何明文导出接口；RSA 公钥可通过 `/keys/{id}/public` 导出。
+- 敏感/私钥材料在快照中以主密钥 AES-GCM 加密保存，服务不提供任何明文导出接口；RSA 公钥可通过 `/keys/{id}/public` 导出。
+
+### 角色权限规则
+
+- 密钥对象管理与密码运算（生成、导入、属性查询、导出公钥、销毁、签名、验签、加密、解密、摘要、包装、解包）**只允许 `USER` 会话**执行。
+- `SO` 会话执行上述任何操作都会被拒绝，返回 `ROLE_REQUIRED`（HTTP 403），与未登录
+  （`NOT_LOGGED_IN`）、会话句柄无效（`SESSION_HANDLE_INVALID`）、令牌锁定（`TOKEN_LOCKED`）明确区分。
+- 管理操作保持可用：`POST /lock`（SO 会话）、`POST /unlock`（SO PIN）、`GET /status`、会话打开/关闭/清理。
+- 令牌锁定后，除解锁与管理查询外的所有操作仍返回 `TOKEN_LOCKED`。
+
+### 密钥属性：`extractable`（可导出性）
+
+- 含义：是否允许该密钥被 `POST /keys/wrap` 包装导出。
+- 默认值：`false`。生成（`POST /keys/generate`）与导入（`POST /keys/import`）时可显式传入
+  `extractable: true/false`；不传入时保持既有默认（不可导出），既有客户端无需修改请求。
+- 该属性随令牌快照持久化，进程重启后保持一致，并在 `GET /keys/{id}` 中如实返回。
+- 对不可导出密钥执行包装会被拒绝，返回 `KEY_NOT_EXTRACTABLE`（HTTP 403），与用途不允许
+  （`KEY_USAGE_VIOLATION`）、密钥不存在（`KEY_NOT_FOUND`）、密钥已销毁（`KEY_DESTROYED`）互相区分。
+- 可导出密钥被包装后，解包得到的副本保留同样的 `extractable` 取值。
+
+### 会话清理
+
+- `DELETE /api/hsm/sessions` 一次性清理全部会话：所有已发放句柄立即失效，客户端需重新打开会话并登录。
+- 清理只影响会话状态：不改变令牌锁定状态、PIN 错误计数、密钥对象及其约束；随后可正常新开会话与登录。
+- `DELETE /api/hsm/sessions/{handle}` 只关闭单个会话，与整体清理互不干扰。
 
 ## 生命周期
 
 1. **初始化**：`POST /api/hsm/initialize` 建立 SO/USER 两类 PIN（PBKDF2-HMAC-SHA256 + 随机盐）。
 2. **打开会话与登录**：未初始化、令牌锁定、未登录都会被拒绝。
 3. **密钥管理**：生成、导入、查询、导出公钥、销毁；销毁为墓碑状态，任何后续使用返回 `KEY_DESTROYED`。
-4. **密码运算**：RSA 使用 `SHA256withRSA` 签名/验签与 `RSA/ECB/PKCS1Padding` 加解密；AES 使用 `AES/GCM/NoPadding`（随机 12 字节 IV，AAD 绑定 keyId）；摘要使用 `SHA-256`。
-5. **包装/解包**：包装密钥必须是允许 `WRAP` 的 AES 密钥，解包需要 `UNWRAP`。信封为 JSON，`header`（算法、位数、用途、敏感性、公钥）作为 AES-GCM 的 AAD 与密文绑定；篡改信封或密文会在 GCM 认证时失败（`UNWRAPPING_FAILED`）。解包后对象的算法、位数与用途集合与源密钥一致、行为等价；用途模板与信封不一致时拒绝（`KEY_USAGE_VIOLATION`）。
+4. **密码运算**：RSA 使用 `SHA256withRSA` 签名/验签与 `RSA/ECB/PKCS1Padding` 加解密；AES 使用 `AES/GCM/NoPadding`（随机 12 字节 IV，AAD 为与密钥 id 无关的固定常量，保证包装副本与源密钥互通）；摘要使用 `SHA-256`。
+5. **包装/解包**：包装密钥必须是允许 `WRAP` 的 AES 密钥，解包需要 `UNWRAP`；被包装密钥必须 `extractable=true`。信封为 JSON，`header`（算法、位数、用途、敏感性、可导出性、公钥）作为 AES-GCM 的 AAD 与密文绑定；篡改信封或密文会在 GCM 认证时失败（`UNWRAPPING_FAILED`）。解包后对象的算法、位数、用途集合、敏感性与可导出性与源密钥完全一致；用途模板与信封不一致时拒绝（`KEY_USAGE_VIOLATION`）。
 6. **锁定/解锁**：锁定后除 `POST /unlock` 与 `GET /status` 等管理操作外，所有操作返回 `TOKEN_LOCKED`。
+
+### 包装/解包互通语义
+
+解包得到的副本与源密钥**行为等价、双向互通**：
+
+- 源密钥加密的数据可由副本解密，副本加密的数据可由源密钥解密（AES 与 RSA 均成立）。
+- 源密钥产生的签名可由副本验签通过，副本产生的签名可由源密钥验签通过。
+- 副本在密钥类型、长度、允许用途集合、敏感性与可导出性上与源密钥完全一致，往返不会放宽或丢失任何约束。
+- 互通性跨进程重启保持：重启前包装的信封可在重启后解包，副本与源密钥的双向互通在重启后依然成立。
 
 ## 并发语义
 
 - 所有会改变持久化状态的操作在 `HsmToken` 的单一监视器锁内执行，状态变更与原子落盘处于同一临界区，多会话/多线程并发下操作串行化提交，不会出现交错的部分状态。
 - 会话表为 `ConcurrentHashMap`，句柄全局递增；会话登录态仅保存在各自的 `Session` 对象上，`closeSession` 只移除目标会话，不触碰其他会话的登录态或进行中的操作。
+- `closeAllSessions` 同样在该锁内执行，与包装、解包、销毁等操作串行化：任一操作要么完全生效要么完全无效，不会出现半生效状态。
+- 包装/解包过程中若包装密钥或目标密钥已被销毁，操作明确失败并返回 `KEY_DESTROYED`；被篡改的信封在 GCM 认证处失败（`UNWRAPPING_FAILED`），不影响其他密钥与其他会话。
 - 内存密码运算也在临界区内完成后再返回，保证“返回成功”即“已可被其他会话观察到”。
 
 ## 崩溃恢复（原子落盘）
@@ -69,12 +104,13 @@ mvn test                     # 全部自动化测试
 | `POST /lock` | SO 会话锁定令牌 |
 | `POST /unlock` | SO PIN 解锁，清零 USER 计数，关闭全部会话 |
 | `POST /sessions` | 打开会话，返回 `sessionHandle` |
+| `DELETE /sessions` | 一次性清理全部会话（只影响会话状态） |
 | `DELETE /sessions/{handle}` | 关闭单个会话 |
 | `POST /sessions/{handle}/login` | 按 `role`（`SO`/`USER`）登录 |
 | `POST /sessions/{handle}/logout` | 登出，不影响其他会话 |
 | `GET /sessions/{handle}` | 查询会话当前角色 |
-| `POST /keys/generate` | 生成 AES/RSA 密钥 |
-| `POST /keys/import` | 导入 AES 原始密钥或 RSA 私钥+公钥 |
+| `POST /keys/generate` | 生成 AES/RSA 密钥（可选 `extractable`，默认 `false`） |
+| `POST /keys/import` | 导入 AES 原始密钥或 RSA 私钥+公钥（可选 `extractable`，默认 `false`） |
 | `GET /keys/{id}?sessionHandle=` | 查询密钥属性（不含任何材料） |
 | `GET /keys/{id}/public?sessionHandle=` | 导出 RSA 公钥 |
 | `DELETE /keys/{id}?sessionHandle=` | 销毁密钥 |
@@ -122,10 +158,23 @@ hsm/
 ## 测试覆盖
 
 - `LifecycleSessionLoginTest`：生命周期、会话独立性、并发会话隔离、PIN 累计锁定与 SO 解锁、角色分离。
+- `RoleAccessControlTest`：SO 会话对全部密钥管理与密码运算的越权拒绝（`ROLE_REQUIRED`）、与未登录/句柄无效/令牌锁定的区分、重启后角色规则保持。
 - `KeyLifecycleUsageTest`：生成/导入、AES/RSA 运算、用途拒绝、材料不外泄、销毁后失败、未知密钥。
-- `WrapUnwrapTest`：AES/RSA 包装往返、用途保持、用途不匹配拒绝、篡改信封认证失败。
+- `ExtractableKeyTest`：`extractable` 默认值、显式指定、不可导出拒绝原因可区分、副本保留可导出性、销毁/缺失密钥原因不混同、重启后保持。
+- `WrapUnwrapTest`：AES/RSA 包装往返、源↔副本双向加解密与签名验签互通、用途保持、用途不匹配拒绝、篡改信封认证失败。
+- `RestartConsistencyTest`：重启前包装重启后解包、互通性跨重启保持、可导出性与用途约束跨重启保持、会话清理规则与角色规则跨重启保持。
+- `SessionCleanupTest`：一次性清理全部会话、清理只影响会话状态、单会话关闭与整体清理互不干扰。
+- `ConcurrencyConsistencyTest`：并发包装/解包/销毁/清理的原子性、销毁后相关操作明确失败、篡改信封不影响其他密钥与会话。
 - `CrashRecoveryTest`：密钥与材料、PIN 计数与锁定、令牌锁定、销毁状态在“重启”（同目录新建实例）后恢复。
-- `HsmRestFlowTest` / `HsmRestErrorTest`：REST 端到端流程与错误码 HTTP 映射。
+- `HsmRestFlowTest` / `HsmRestErrorTest` / `HsmRestSecurityTest`：REST 端到端流程、错误码 HTTP 映射、SO 越权 403、`extractable` 字段、会话清理端点。
+
+## 本地验证
+
+```bash
+mvn test                                   # 全部自动化测试
+mvn test -Dtest='WrapUnwrapTest'           # 只跑包装/解包互通测试
+mvn spring-boot:run                        # 本地启动后可用上方 curl 示例手工验证
+```
 
 ## 安全边界说明
 

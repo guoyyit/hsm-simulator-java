@@ -75,6 +75,16 @@ public class HsmController {
         return Map.of("closed", handle);
     }
 
+    /**
+     * Drops every open session at once. Only session state is affected; the
+     * lock flag, PIN counters and key objects are left untouched.
+     */
+    @DeleteMapping("/sessions")
+    public Map<String, Object> closeAllSessions() {
+        token.closeAllSessions();
+        return Map.of("closedAll", true);
+    }
+
     @PostMapping("/sessions/{handle}/login")
     public Map<String, Object> login(@PathVariable long handle, @RequestBody LoginRequest request) {
         token.login(handle, UserType.valueOf(request.role()), request.pin());
@@ -103,7 +113,7 @@ public class HsmController {
     public Map<String, Object> generateKey(@RequestBody GenerateKeyRequest request) {
         String id = token.generateKey(request.sessionHandle(),
                 KeyType.valueOf(request.keyType()), request.bits(),
-                request.label(), parseUsages(request.usages()));
+                request.label(), parseUsages(request.usages()), request.extractable());
         return token.getKeyInfo(request.sessionHandle(), id);
     }
 
@@ -114,7 +124,8 @@ public class HsmController {
                 KeyType.valueOf(request.keyType()), request.label(),
                 parseUsages(request.usages()), request.sensitive(),
                 decoder.decode(request.material()),
-                request.publicMaterial() == null ? null : decoder.decode(request.publicMaterial()));
+                request.publicMaterial() == null ? null : decoder.decode(request.publicMaterial()),
+                request.extractable());
         return token.getKeyInfo(request.sessionHandle(), id);
     }
 
@@ -198,13 +209,17 @@ public class HsmController {
     public record LoginRequest(String role, String pin) {
     }
 
+    /**
+     * {@code extractable} is optional; when absent the token default
+     * (non-extractable) applies, so existing clients need no changes.
+     */
     public record GenerateKeyRequest(long sessionHandle, String keyType, int bits,
-                                     String label, Set<String> usages) {
+                                     String label, Set<String> usages, Boolean extractable) {
     }
 
     public record ImportKeyRequest(long sessionHandle, String keyType, String label,
                                    Set<String> usages, boolean sensitive,
-                                   String material, String publicMaterial) {
+                                   String material, String publicMaterial, Boolean extractable) {
     }
 
     public record KeyDataRequest(long sessionHandle, String keyId, String data) {
