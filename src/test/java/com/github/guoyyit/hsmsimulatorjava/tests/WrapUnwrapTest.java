@@ -42,7 +42,7 @@ class WrapUnwrapTest {
         String kekId = token.generateKey(session, KeyType.AES, 256, "kek",
                 EnumSet.of(KeyUsage.WRAP, KeyUsage.UNWRAP));
         EnumSet<KeyUsage> usages = EnumSet.of(KeyUsage.ENCRYPT, KeyUsage.DECRYPT);
-        String targetId = token.generateKey(session, KeyType.AES, 128, "target", usages);
+        String targetId = token.generateKey(session, KeyType.AES, 128, "target", usages, true);
         byte[] ciphertextBefore = token.encrypt(session, targetId, MESSAGE);
 
         byte[] wrapped = token.wrapKey(session, kekId, targetId);
@@ -65,7 +65,7 @@ class WrapUnwrapTest {
         String kekId = token.generateKey(session, KeyType.AES, 256, "kek",
                 EnumSet.of(KeyUsage.WRAP, KeyUsage.UNWRAP));
         EnumSet<KeyUsage> usages = EnumSet.of(KeyUsage.SIGN, KeyUsage.VERIFY);
-        String targetId = token.generateKey(session, KeyType.RSA, 2048, "rsa-target", usages);
+        String targetId = token.generateKey(session, KeyType.RSA, 2048, "rsa-target", usages, true);
         byte[] signature = token.sign(session, targetId, MESSAGE);
 
         byte[] wrapped = token.wrapKey(session, kekId, targetId);
@@ -84,7 +84,7 @@ class WrapUnwrapTest {
         String noWrap = token.generateKey(session, KeyType.AES, 256, "no-wrap",
                 EnumSet.of(KeyUsage.ENCRYPT));
         String target = token.generateKey(session, KeyType.AES, 128, "target",
-                EnumSet.of(KeyUsage.ENCRYPT, KeyUsage.DECRYPT));
+                EnumSet.of(KeyUsage.ENCRYPT, KeyUsage.DECRYPT), true);
 
         HsmException wrap = assertThrows(HsmException.class,
                 () -> token.wrapKey(session, noWrap, target));
@@ -106,7 +106,7 @@ class WrapUnwrapTest {
         String kekId = token.generateKey(session, KeyType.AES, 256, "kek",
                 EnumSet.of(KeyUsage.WRAP, KeyUsage.UNWRAP));
         String target = token.generateKey(session, KeyType.AES, 128, "target",
-                EnumSet.of(KeyUsage.ENCRYPT, KeyUsage.DECRYPT));
+                EnumSet.of(KeyUsage.ENCRYPT, KeyUsage.DECRYPT), true);
         byte[] wrapped = token.wrapKey(session, kekId, target);
         com.fasterxml.jackson.databind.ObjectMapper mapper =
                 new com.fasterxml.jackson.databind.ObjectMapper();

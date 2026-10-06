@@ -75,6 +75,12 @@ public class HsmController {
         return Map.of("closed", handle);
     }
 
+    @DeleteMapping("/sessions")
+    public Map<String, Object> closeAllSessions() {
+        int closed = token.closeAllSessions();
+        return Map.of("closedAll", true, "closedCount", closed);
+    }
+
     @PostMapping("/sessions/{handle}/login")
     public Map<String, Object> login(@PathVariable long handle, @RequestBody LoginRequest request) {
         token.login(handle, UserType.valueOf(request.role()), request.pin());
@@ -103,7 +109,7 @@ public class HsmController {
     public Map<String, Object> generateKey(@RequestBody GenerateKeyRequest request) {
         String id = token.generateKey(request.sessionHandle(),
                 KeyType.valueOf(request.keyType()), request.bits(),
-                request.label(), parseUsages(request.usages()));
+                request.label(), parseUsages(request.usages()), request.extractable());
         return token.getKeyInfo(request.sessionHandle(), id);
     }
 
@@ -112,7 +118,7 @@ public class HsmController {
         Base64.Decoder decoder = Base64.getDecoder();
         String id = token.importKey(request.sessionHandle(),
                 KeyType.valueOf(request.keyType()), request.label(),
-                parseUsages(request.usages()), request.sensitive(),
+                parseUsages(request.usages()), request.sensitive(), request.extractable(),
                 decoder.decode(request.material()),
                 request.publicMaterial() == null ? null : decoder.decode(request.publicMaterial()));
         return token.getKeyInfo(request.sessionHandle(), id);
@@ -199,11 +205,11 @@ public class HsmController {
     }
 
     public record GenerateKeyRequest(long sessionHandle, String keyType, int bits,
-                                     String label, Set<String> usages) {
+                                     String label, Set<String> usages, Boolean extractable) {
     }
 
     public record ImportKeyRequest(long sessionHandle, String keyType, String label,
-                                   Set<String> usages, boolean sensitive,
+                                   Set<String> usages, boolean sensitive, Boolean extractable,
                                    String material, String publicMaterial) {
     }
 

@@ -134,8 +134,18 @@ public class HsmToken {
         sessions.close(handle);
     }
 
-    public void closeAllSessions() {
-        sessions.closeAll();
+    /**
+     * Drops every open session at once. This only touches session state: the
+     * token lock flag, PIN counters and all key objects are left untouched,
+     * and clients can immediately open fresh sessions and log in again. It is
+     * a session-plane management action and stays available while the token
+     * is locked. Serialized on the token lock so it cannot interleave with a
+     * half-completed operation.
+     */
+    public int closeAllSessions() {
+        synchronized (lock) {
+            return sessions.closeAll();
+        }
     }
 
     public void login(long sessionHandle, UserType userType, String pin) {
@@ -169,6 +179,16 @@ public class HsmToken {
 
     public String generateKey(long sessionHandle, KeyType keyType, int bits,
                               String label, Set<KeyUsage> usages) {
+        return generateKey(sessionHandle, keyType, bits, label, usages, null);
+    }
+
+    /**
+     * Generates a key. {@code extractable} decides whether the key may be
+     * exported via wrapping; when {@code null} the established default
+     * (non-extractable) applies.
+     */
+    public String generateKey(long sessionHandle, KeyType keyType, int bits,
+                              String label, Set<KeyUsage> usages, Boolean extractable) {
         if (keyType == null) {
             throw new HsmException(HsmError.INVALID_ARGUMENT, "keyType required");
         }
@@ -197,7 +217,7 @@ public class HsmToken {
                 keyBits = rsaBits;
             }
             StoredKey key = new StoredKey(id, safeLabel(label), keyType, keyBits,
-                    normalizedUsages, true, false, System.currentTimeMillis(),
+                    normalizedUsages, true, resolveExtractable(extractable), System.currentTimeMillis(),
                     protectedMaterial, publicMaterial);
             snapshot.getKeys().put(id, key);
             persist(snapshot);
@@ -207,6 +227,16 @@ public class HsmToken {
 
     public String importKey(long sessionHandle, KeyType keyType, String label, Set<KeyUsage> usages,
                             boolean sensitive, byte[] rawOrPrivate, byte[] publicPart) {
+        return importKey(sessionHandle, keyType, label, usages, sensitive, null, rawOrPrivate, publicPart);
+    }
+
+    /**
+     * Imports a key. {@code extractable} decides whether the imported key may
+     * be exported via wrapping; when {@code null} the established default
+     * (non-extractable) applies.
+     */
+    public String importKey(long sessionHandle, KeyType keyType, String label, Set<KeyUsage> usages,
+                            boolean sensitive, Boolean extractable, byte[] rawOrPrivate, byte[] publicPart) {
         if (keyType == null || rawOrPrivate == null || rawOrPrivate.length == 0) {
             throw new HsmException(HsmError.INVALID_ARGUMENT, "keyType and material required");
         }
@@ -230,7 +260,7 @@ public class HsmToken {
                 keyBits = rsaKeyBits(rawOrPrivate);
             }
             StoredKey key = new StoredKey(id, safeLabel(label), keyType, keyBits,
-                    normalizedUsages, sensitive, false, System.currentTimeMillis(),
+                    normalizedUsages, sensitive, resolveExtractable(extractable), System.currentTimeMillis(),
                     protect(id, rawOrPrivate), publicMaterial);
             snapshot.getKeys().put(id, key);
             persist(snapshot);
@@ -332,9 +362,12 @@ public class HsmToken {
 
     /**
      * Exports a key only as protected ciphertext under an AES wrapping key
-     * that permits WRAP. Key type, size and allowed usages are bound to the
-     * envelope as AES-GCM AAD, so they cannot be altered in transit and are
-     * preserved exactly on unwrap.
+     * that permits WRAP. Key type, size, allowed usages, sensitivity and
+     * extractability are bound to the envelope as AES-GCM AAD, so they cannot
+     * be altered in transit and are preserved exactly on unwrap. A target key
+     * marked non-extractable is rejected with
+     * {@link HsmError#KEY_NOT_EXTRACTABLE}, distinct from usage, existence and
+     * destruction failures.
      */
     public byte[] wrapKey(long sessionHandle, String wrappingKeyId, String targetKeyId) {
         synchronized (lock) {
@@ -343,6 +376,10 @@ public class HsmToken {
             StoredKey target = requireUsableKey(targetKeyId, null);
             if (wrappingKey.getKeyType() != KeyType.AES) {
                 throw new HsmException(HsmError.INVALID_KEY_TYPE, "wrapping key must be AES");
+            }
+            if (!target.isExtractable()) {
+                throw new HsmException(HsmError.KEY_NOT_EXTRACTABLE,
+                        "key " + targetKeyId + " is not extractable");
             }
             byte[] headerBytes = buildEnvelopeHeader(target);
             byte[] wrappedMaterial;
@@ -363,7 +400,9 @@ public class HsmToken {
      * Imports a wrapped key under an AES key that permits UNWRAP. When the
      * caller supplies a usage template it must equal the usages embedded in
      * the envelope; otherwise the embedded usages are restored. The imported
-     * key is behaviorally equivalent to the wrapped source key.
+     * key is behaviorally equivalent to the wrapped source key. Malformed or
+     * tampered envelopes fail with {@link HsmError#UNWRAPPING_FAILED} before
+     * any key object is created.
      */
     public String unwrapKey(long sessionHandle, String wrappingKeyId, byte[] wrapped,
                             String label, Set<KeyUsage> usages) {
@@ -377,47 +416,70 @@ public class HsmToken {
                 throw new HsmException(HsmError.INVALID_KEY_TYPE, "wrapping key must be AES");
             }
             Map<String, String> envelope;
+            try {
+                envelope = mapper.readValue(wrapped, new TypeReference<>() {
+                });
+            } catch (Exception e) {
+                throw new HsmException(HsmError.UNWRAPPING_FAILED, "malformed wrapped blob");
+            }
+            byte[] kekMaterial = unprotect(wrappingKey);
             byte[] headerBytes;
             byte[] rawKey;
             try {
-                envelope = readJson(wrapped, new TypeReference<>() {
-                });
                 headerBytes = Base64.getDecoder().decode(envelope.get("header"));
-                rawKey = crypto.aesGcmDecryptWithIv(unprotect(wrappingKey),
+                rawKey = crypto.aesGcmDecryptWithIv(kekMaterial,
                         Base64.getDecoder().decode(envelope.get("wrapped")), headerBytes);
-            } catch (HsmException e) {
-                throw e;
             } catch (RuntimeException e) {
                 throw new HsmException(HsmError.UNWRAPPING_FAILED, "malformed wrapped blob");
             }
             if (rawKey == null) {
                 throw new HsmException(HsmError.UNWRAPPING_FAILED, "wrapped blob cannot be opened");
             }
+            Map<String, Object> header;
             try {
-                Map<String, Object> header = readJson(headerBytes, new TypeReference<>() {
+                header = mapper.readValue(headerBytes, new TypeReference<>() {
                 });
-                KeyType keyType = KeyType.valueOf((String) header.get("keyType"));
-                int keyBits = ((Number) header.get("keyBits")).intValue();
-                Set<KeyUsage> embeddedUsages = parseUsages(header.get("usages"));
-                if (usages != null && !embeddedUsages.equals(normalizeUsages(usages))) {
-                    throw new HsmException(HsmError.KEY_USAGE_VIOLATION,
-                            "unwrap template differs from wrapped key usages");
-                }
-                boolean sensitive = Boolean.TRUE.equals(header.get("sensitive"));
-                byte[] publicMaterial = header.get("public") == null ? null
+            } catch (Exception e) {
+                throw new HsmException(HsmError.UNWRAPPING_FAILED, "malformed wrapped header");
+            }
+            KeyType keyType;
+            int keyBits;
+            Set<KeyUsage> embeddedUsages;
+            boolean sensitive;
+            boolean extractable;
+            byte[] publicMaterial;
+            try {
+                keyType = KeyType.valueOf((String) header.get("keyType"));
+                keyBits = ((Number) header.get("keyBits")).intValue();
+                embeddedUsages = parseUsages(header.get("usages"));
+                sensitive = Boolean.TRUE.equals(header.get("sensitive"));
+                extractable = Boolean.TRUE.equals(header.get("extractable"));
+                publicMaterial = header.get("public") == null ? null
                         : Base64.getDecoder().decode((String) header.get("public"));
-                String id = newKeyId();
-                StoredKey key = new StoredKey(id, safeLabel(label), keyType, keyBits,
-                        EnumSet.copyOf(embeddedUsages), sensitive, false, System.currentTimeMillis(),
-                        protect(id, rawKey), publicMaterial);
-                snapshot.getKeys().put(id, key);
-                persist(snapshot);
-                return id;
             } catch (HsmException e) {
                 throw e;
             } catch (RuntimeException e) {
                 throw new HsmException(HsmError.UNWRAPPING_FAILED, "malformed wrapped header");
             }
+            if (keyType == KeyType.AES) {
+                int materialBits = rawKey.length * 8;
+                if (materialBits != keyBits
+                        || (materialBits != 128 && materialBits != 192 && materialBits != 256)) {
+                    throw new HsmException(HsmError.UNWRAPPING_FAILED,
+                            "wrapped material does not match header");
+                }
+            }
+            if (usages != null && !embeddedUsages.equals(normalizeUsages(usages))) {
+                throw new HsmException(HsmError.KEY_USAGE_VIOLATION,
+                        "unwrap template differs from wrapped key usages");
+            }
+            String id = newKeyId();
+            StoredKey key = new StoredKey(id, safeLabel(label), keyType, keyBits,
+                    EnumSet.copyOf(embeddedUsages), sensitive, extractable, System.currentTimeMillis(),
+                    protect(id, rawKey), publicMaterial);
+            snapshot.getKeys().put(id, key);
+            persist(snapshot);
+            return id;
         }
     }
 
@@ -480,8 +542,11 @@ public class HsmToken {
     }
 
     /**
-     * Operations on stored objects require an unlocked token and a logged-in
-     * session. Role-specific checks are layered on top where needed.
+     * Operations on stored objects and all cryptographic operations require an
+     * unlocked token and a session logged in as the ordinary USER. An SO
+     * session is rejected with {@link HsmError#ROLE_REQUIRED}, a reason kept
+     * distinct from {@link HsmError#NOT_LOGGED_IN},
+     * {@link HsmError#SESSION_HANDLE_INVALID} and {@link HsmError#TOKEN_LOCKED}.
      */
     private Session requireOperableSession(long handle) {
         requireInitialized();
@@ -492,6 +557,7 @@ public class HsmToken {
         if (!session.isLoggedIn()) {
             throw new HsmException(HsmError.NOT_LOGGED_IN);
         }
+        session.requireRole(UserType.USER);
         return session;
     }
 
@@ -500,6 +566,14 @@ public class HsmToken {
             throw new HsmException(HsmError.INVALID_ARGUMENT, "at least one usage required");
         }
         return EnumSet.copyOf(usages);
+    }
+
+    /**
+     * Extractability defaults to {@code false} (the established behavior)
+     * unless the caller explicitly opts in at generation or import time.
+     */
+    private boolean resolveExtractable(Boolean extractable) {
+        return extractable != null && extractable;
     }
 
     private String safeLabel(String label) {
@@ -536,8 +610,13 @@ public class HsmToken {
         }
     }
 
+    /**
+     * AAD for data encryption is deliberately independent of the key object
+     * id: a wrapped-then-unwrapped copy is behaviorally equivalent to its
+     * source, so ciphertext produced by one must open under the other.
+     */
     private byte[] aadFor(StoredKey key) {
-        return ("hsm-key:" + key.getId()).getBytes(StandardCharsets.UTF_8);
+        return ("hsm-data:" + key.getKeyType().name()).getBytes(StandardCharsets.UTF_8);
     }
 
     private byte[] protect(String keyId, byte[] raw) {
@@ -606,6 +685,7 @@ public class HsmToken {
         header.put("keyBits", target.getKeyBits());
         header.put("usages", target.getUsages().stream().map(Enum::name).sorted().toList());
         header.put("sensitive", target.isSensitive());
+        header.put("extractable", target.isExtractable());
         header.put("public", target.getPublicMaterial() == null ? null
                 : Base64.getEncoder().encodeToString(target.getPublicMaterial()));
         return writeJson(header);
@@ -628,14 +708,6 @@ public class HsmToken {
             return mapper.writeValueAsBytes(value);
         } catch (JsonProcessingException e) {
             throw new HsmException(HsmError.INTERNAL_ERROR, e.getMessage());
-        }
-    }
-
-    private <T> T readJson(byte[] json, TypeReference<T> type) {
-        try {
-            return mapper.readValue(json, type);
-        } catch (Exception e) {
-            throw new HsmException(HsmError.INVALID_ARGUMENT, "malformed wrapped envelope");
         }
     }
 }

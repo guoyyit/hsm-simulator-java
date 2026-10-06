@@ -34,9 +34,16 @@ public class SessionManager {
         }
     }
 
-    public void closeAll() {
+    /**
+     * Closes every open session and returns how many were closed. Handles
+     * issued before this call become invalid; the handle counter keeps
+     * moving forward so stale handles are never reused.
+     */
+    public int closeAll() {
+        int count = sessions.size();
         sessions.values().forEach(Session::close);
         sessions.clear();
+        return count;
     }
 
     public Collection<Session> all() {
